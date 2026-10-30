@@ -45,13 +45,13 @@ Realm 内核的版本检查和下载来自其官方发布仓库 `zhboner/realm`�
 python3 -m unittest discover -s tests -v
 ```
 
-安装 `lsof` 后，可使用真实 Realm 内核执行本地 TCP 转发集成测试（进程和配置均在临时目录中）：
+安装 `lsof` 后，可使用真实 Realm 内核执行本地 TCP/UDP 转发集成测试（进程和配置均在临时目录中）：
 
 ```bash
 REALM_BINARY=/absolute/path/to/realm python3 -m unittest discover -s tests -p 'integration_*.py' -v
 ```
 
-GitHub Actions 还会在 Ubuntu 上创建临时 systemd 服务，验证真实服务重启、监听端口、IPv4/IPv6 转发及端口冲突回滚。手动运行该模式时，在上述命令前增加 `REALM_TEST_SYSTEMD=1`，需要可免密执行 sudo；不会使用服务器已有的 `realm.service`。
+GitHub Actions 还会在 Ubuntu 上创建临时 systemd 服务，验证真实服务重启、监听端口、IPv4/IPv6、TCP/UDP 转发及端口冲突回滚。手动运行该模式时，在上述命令前增加 `REALM_TEST_SYSTEMD=1`，需要可免密执行 sudo；不会使用服务器已有的 `realm.service`。
 
 ## 来源
 

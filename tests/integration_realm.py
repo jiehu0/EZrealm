@@ -203,6 +203,11 @@ class IntegrationCases:
             socket.create_connection(("127.0.0.1", self.listen_port), timeout=.3)
 
     def test_occupied_port_rolls_back_and_restores_traffic(self):
+        # With both protocols enabled, UDP can stay alive after TCP fails to bind.
+        self.original = self.original.replace('use_udp = false', 'use_udp = true')
+        self.config.write_text(self.original)
+        self.start_realm()
+        self.assert_forward(self.listen_port, b"A:payload")
         with socket.socket() as blocker:
             blocker.bind(("127.0.0.1", 0))
             blocker.listen()
@@ -213,6 +218,43 @@ class IntegrationCases:
         self.assertEqual(self.config.read_text(), self.original)
         self.assert_forward(self.listen_port, b"A:payload")
         self.assert_forward(self.other_port, b"A:payload")
+
+    def test_udp_only_target_change(self):
+        def udp_server(prefix):
+            class Handler(socketserver.BaseRequestHandler):
+                def handle(self):
+                    data, sock = self.request
+                    sock.sendto(prefix + data, self.client_address)
+            server = socketserver.ThreadingUDPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, kwargs={"poll_interval": .05}, daemon=True).start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+            return server
+
+        def check_udp(expected):
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.settimeout(.3)
+                deadline = time.monotonic() + 4
+                while time.monotonic() < deadline:
+                    sock.sendto(b"payload", ("127.0.0.1", self.listen_port))
+                    try:
+                        self.assertEqual(sock.recvfrom(1024)[0], expected)
+                        return
+                    except TimeoutError:
+                        pass
+                self.fail("UDP forwarding did not return a response")
+
+        a, b = udp_server(b"UA:"), udp_server(b"UB:")
+        self.config.write_text(
+            '[network]\nno_tcp = true\nuse_udp = true\n[[endpoints]]\n'
+            f'listen = "127.0.0.1:{self.listen_port}"\n'
+            f'remote = "127.0.0.1:{a.server_address[1]}"\n'
+        )
+        self.start_realm()
+        check_udp(b"UA:payload")
+        result = self.edit(("", "", "", str(b.server_address[1]), "UDP"))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        check_udp(b"UB:payload")
 
     def test_ipv6_listen_and_target(self):
         try:
