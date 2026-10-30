@@ -3,9 +3,9 @@
 # ========================================
 # 全局配置
 # ========================================
-CURRENT_VERSION="1.0.3"
-UPDATE_URL="https://raw.githubusercontent.com/qqrrooty/EZrealm/main/test/realm.sh"
-VERSION_CHECK_URL="https://raw.githubusercontent.com/qqrrooty/EZrealm/main/version.txt"
+CURRENT_VERSION="1.2.0"
+UPDATE_URL="https://raw.githubusercontent.com/jiehu0/EZrealm/main/test/realm.sh"
+VERSION_CHECK_URL="https://raw.githubusercontent.com/jiehu0/EZrealm/main/version.txt"
 REALM_DIR="/root/realm"
 CONFIG_FILE="$REALM_DIR/config.toml"
 SERVICE_FILE="/etc/systemd/system/realm.service"
@@ -30,15 +30,18 @@ init_check() {
         exit 1
     fi
 
-    # 检查curl安装
-    if ! command -v curl &> /dev/null; then
-        echo -e "${YELLOW}▶ 正在安装curl工具...${NC}"
-        if command -v apt-get &> /dev/null; then
-            apt-get update && apt-get install -y curl
-        elif command -v yum &> /dev/null; then
-            yum install -y curl
+    # curl 用于更新，lsof 用于确认规则端口确实由 Realm 进程持有。
+    local dependency missing_dependencies=()
+    for dependency in curl lsof; do
+        command -v "$dependency" >/dev/null 2>&1 || missing_dependencies+=("$dependency")
+    done
+    if [[ ${#missing_dependencies[@]} -gt 0 ]]; then
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update && apt-get install -y "${missing_dependencies[@]}" || exit 1
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y "${missing_dependencies[@]}" || exit 1
         else
-            echo -e "${RED}✖ 无法安装curl，请手动安装${NC}"
+            echo "请先安装依赖：${missing_dependencies[*]}"
             exit 1
         fi
     fi
@@ -223,193 +226,428 @@ EOF
     echo -e "${GREEN}✔ 安装完成！${NC}"
 }
 
-# 查看转发规则
+# 按 TOML 表边界读取规则，不依赖字段顺序或固定行号。
+load_rules() {
+    RULE_STARTS=() RULE_ENDS=() RULE_LISTENS=() RULE_REMOTES=() RULE_REMARKS=()
+    [[ -f "$CONFIG_FILE" ]] || return 0
+    local start end listen remote remark
+    while IFS= read -r start && IFS= read -r end &&
+          IFS= read -r listen && IFS= read -r remote && IFS= read -r remark; do
+        RULE_STARTS+=("$start") RULE_ENDS+=("$end")
+        RULE_LISTENS+=("$listen") RULE_REMOTES+=("$remote") RULE_REMARKS+=("$remark")
+    done < <(awk '
+        function scalar(line, value) {
+            sub(/^[^=]*=[ \t]*/, "", line)
+            if (match(line, /^"[^"\\]*"/)) value = substr(line, 2, RLENGTH - 2)
+            else if (match(line, /^\047[^\047]*\047/)) value = substr(line, 2, RLENGTH - 2)
+            else return "!无法识别的地址格式"
+            line = substr(line, RLENGTH + 1)
+            if (line !~ /^[ \t]*(#.*)?$/) return "!无法识别的地址格式"
+            return value
+        }
+        function emit(last) {
+            if (!start) return
+            if (lc != 1) listen = "!listen 字段缺失或重复"
+            if (rc != 1) remote = "!remote 字段缺失或重复"
+            printf "%d\n%d\n%s\n%s\n%s\n", start, last, listen, remote, remark
+        }
+        /^[ \t]*\[/ {
+            if (start && $0 ~ /^[ \t]*\[\[?endpoints\./) { nested = 1; next }
+            emit(NR - 1)
+            start = 0
+            if ($0 ~ /^[ \t]*\[\[endpoints\]\][ \t]*(#.*)?$/) {
+                start = NR; listen = remote = remark = ""; lc = rc = nested = 0
+            }
+        }
+        start && !nested && /^[ \t]*listen[ \t]*=/ { listen = scalar($0); lc++ }
+        start && !nested && /^[ \t]*remote[ \t]*=/ { remote = scalar($0); rc++ }
+        start && !nested && /^[ \t]*#[ \t]*备注:/ {
+            remark = $0
+            sub(/^[ \t]*#[ \t]*备注:[ \t]?/, "", remark)
+        }
+        END { emit(NR) }
+    ' "$CONFIG_FILE")
+}
+
 show_rules() {
-  echo -e "                   ${YELLOW}当前 Realm 转发规则${NC}                   "
-  echo -e "${BLUE}---------------------------------------------------------------------------------------------------------${NC}${YELLOW}"
-  printf "%-5s| %-30s| %-40s| %-20s\n" "序号" "   本地地址:端口 " "   目标地址:端口 " "备注"
-  echo -e "${NC}${BLUE}---------------------------------------------------------------------------------------------------------${NC}"
-    local IFS=$'\n' # 设置IFS仅以换行符作为分隔符
-    # 搜索所有包含 listen 的行，表示转发规则的起始行
-    local lines=($(grep -n 'listen =' /root/realm/config.toml))
-    
-    if [ ${#lines[@]} -eq 0 ]; then
-  echo -e "没有发现任何转发规则。"
-        return
-    fi
-
-    local index=1
-    for line in "${lines[@]}"; do
-        local line_number=$(echo $line | cut -d ':' -f 1)
-        local listen_info=$(sed -n "${line_number}p" /root/realm/config.toml | cut -d '"' -f 2)
-        local remote_info=$(sed -n "$((line_number + 1))p" /root/realm/config.toml | cut -d '"' -f 2)
-        local remark=$(sed -n "$((line_number-1))p" /root/realm/config.toml | grep "^# 备注:" | cut -d ':' -f 2)
-        
-        local listen_ip_port=$listen_info
-        local remote_ip_port=$remote_info
-        
-    printf "%-4s| %-24s| %-34s| %-20s\n" " $index" "$listen_info" "$remote_info" "$remark"
-    echo -e "${BLUE}---------------------------------------------------------------------------------------------------------${NC}"
-        let index+=1
-    done
-}
-
-# 添加转发规则
-add_rule() {
-    log "添加转发规则"
-    while : ; do
-        echo -e "\n${BLUE}▶ 添加新规则（输入 q 退出）${NC}"
-        
-        # 获取输入
-        read -rp "本地监听端口: " local_port
-        [ "$local_port" = "q" ] && break
-        read -rp "目标服务器IP: " remote_ip
-        read -rp "目标端口: " remote_port
-        read -rp "规则备注: " remark
-
-        # 输入验证
-        if ! [[ "$local_port" =~ ^[0-9]+$ ]] || ! [[ "$remote_port" =~ ^[0-9]+$ ]]; then
-            echo -e "${RED}✖ 端口必须为数字！${NC}"
-            continue
-        fi
-
-        # 监听模式选择
-        echo -e "\n${YELLOW}请选择监听模式：${NC}"
-        echo "1) 双栈监听 [::]:${local_port} (默认)"
-        echo "2) 仅IPv4监听 0.0.0.0:${local_port}"
-        echo "3) 自定义监听地址"
-        read -rp "请输入选项 [1-3] (默认1): " ip_choice
-        ip_choice=${ip_choice:-1}
-
-        case $ip_choice in
-            1)
-                listen_addr="[::]:$local_port"
-                desc="双栈监听"
-                ;;
-            2)
-                listen_addr="0.0.0.0:$local_port"
-                desc="仅IPv4"
-                ;;
-            3)
-                while : ; do
-                    read -rp "请输入完整监听地址(格式如 0.0.0.0:80 或 [::]:443): " listen_addr
-                    # 格式验证
-                    if ! [[ "$listen_addr" =~ ^([0-9a-fA-F.:]+|\[.*\]):[0-9]+$ ]]; then
-                        echo -e "${RED}✖ 格式错误！示例: 0.0.0.0:80 或 [::]:443${NC}"
-                        continue
-                    fi
-                    break
-                done
-                desc="自定义监听"
-                ;;
-            *)
-                echo -e "${RED}无效选择，使用默认值！${NC}"
-                listen_addr="[::]:$local_port"
-                desc="双栈监听"
-                ;;
-        esac
-
-        # 写入配置文件（关键修正点）
-        sudo tee -a "$CONFIG_FILE" > /dev/null <<EOF
-
-[[endpoints]]
-# 备注: $remark 
-listen = "$listen_addr"
-remote = "$remote_ip:$remote_port"
-EOF
-
-        # 双栈提示
-        if [ "$ip_choice" -eq 1 ]; then
-            echo -e "\n${CYAN}ℹ 双栈监听需要确保：${NC}"
-            echo -e "${CYAN}   - Realm 配置中 [network] 段的 ipv6_only = false${NC}"
-            echo -e "${CYAN}   - 系统已启用 IPv6 双栈支持 (sysctl net.ipv6.bindv6only=0)${NC}"
-        fi
-
-        # 重启服务
-        sudo systemctl restart realm.service
-        log "规则已添加: $listen_addr → $remote_ip:$remote_port"
-        echo -e "${GREEN}✔ 添加成功！${NC}"
-        
-        read -rp "继续添加？(y/n): " cont
-        [[ "$cont" != "y" ]] && break
-    done
-}
-
-delete_rule() {
-  echo -e "                   ${YELLOW}当前 Realm 转发规则${NC}                   "
-  echo -e "${BLUE}---------------------------------------------------------------------------------------------------------${NC}${YELLOW}"
-  printf "%-5s| %-30s| %-40s| %-20s\n" "序号" "   本地地址:端口 " "   目标地址:端口 " "备注"
-  echo -e "${NC}${BLUE}---------------------------------------------------------------------------------------------------------${NC}"
-    local IFS=$'\n' # 设置IFS仅以换行符作为分隔符
-    # 搜索所有包含 [[endpoints]] 的行，表示转发规则的起始行
-    local lines=($(grep -n '^\[\[endpoints\]\]' /root/realm/config.toml))
-    
-    if [ ${#lines[@]} -eq 0 ]; then
+    load_rules
+    echo "当前 Realm 转发规则"
+    if [[ ${#RULE_STARTS[@]} -eq 0 ]]; then
         echo "没有发现任何转发规则。"
         return
     fi
-
-    local index=1
-    for line in "${lines[@]}"; do
-        local line_number=$(echo $line | cut -d ':' -f 1)
-        local remark_line=$((line_number + 1))
-        local listen_line=$((line_number + 2))
-        local remote_line=$((line_number + 3))
-
-        local remark=$(sed -n "${remark_line}p" /root/realm/config.toml | grep "^# 备注:" | cut -d ':' -f 2)
-        local listen_info=$(sed -n "${listen_line}p" /root/realm/config.toml | cut -d '"' -f 2)
-        local remote_info=$(sed -n "${remote_line}p" /root/realm/config.toml | cut -d '"' -f 2)
-
-        local listen_ip_port=$listen_info
-        local remote_ip_port=$remote_info
-
-    printf "%-4s| %-24s| %-34s| %-20s\n" " $index" "$listen_info" "$remote_info" "$remark"
-    echo -e "${BLUE}---------------------------------------------------------------------------------------------------------${NC}"
-        let index+=1
+    printf '%-5s | %-28s | %-36s | %s\n' "序号" "本地地址:端口" "目标地址:端口" "备注"
+    local i
+    for ((i=0; i<${#RULE_STARTS[@]}; i++)); do
+        printf '%-5s | %-28s | %-36s | %s\n' "$((i+1))" "${RULE_LISTENS[i]}" "${RULE_REMOTES[i]}" "${RULE_REMARKS[i]}"
     done
+}
 
+select_rule() {
+    show_rules
+    [[ ${#RULE_STARTS[@]} -gt 0 ]] || return 1
+    local choice
+    read -rp "请输入要${1}的规则序号（回车或 q 返回）: " choice || return 1
+    [[ -n "$choice" && "$choice" != q ]] || return 1
+    if [[ ! "$choice" =~ ^[0-9]+$ || ${#choice} -gt 6 ]] ||
+       ((10#$choice < 1 || 10#$choice > ${#RULE_STARTS[@]})); then
+        echo "无效规则序号。"
+        return 1
+    fi
+    RULE_INDEX=$((10#$choice - 1))
+}
 
-    echo "请输入要删除的转发规则序号，直接按回车返回主菜单。"
-    read -p "选择: " choice
-    if [ -z "$choice" ]; then
-        echo "返回主菜单。"
+valid_port() {
+    [[ "$1" =~ ^[0-9]+$ && ${#1} -le 5 ]] && ((10#$1 >= 1 && 10#$1 <= 65535))
+}
+
+valid_ipv4() {
+    local ip="$1" part
+    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    local IFS=.
+    local parts=($ip)
+    for part in "${parts[@]}"; do
+        [[ ${#part} -le 3 && ( "$part" == 0 || "$part" != 0* ) ]] && ((10#$part <= 255)) || return 1
+    done
+}
+
+valid_ipv6() {
+    local ip="$1" tail
+    if [[ "$ip" == *.* ]]; then
+        tail=${ip##*:}
+        valid_ipv4 "$tail" || return 1
+        ip="${ip%:*}:0:0"
+    fi
+    [[ "$ip" == *:* && "$ip" != *:::* && "$ip" =~ ^[0-9a-fA-F:]+$ ]] || return 1
+    [[ "$ip" != :* || "$ip" == ::* ]] || return 1
+    [[ "$ip" != *: || "$ip" == *:: ]] || return 1
+    printf '%s\n' "$ip" | awk '
+        {
+            compressed = index($0, "::") > 0
+            rest = $0; sub(/::/, "", rest)
+            if (index(rest, "::")) exit 1
+            if (!compressed && ($0 ~ /^:/ || $0 ~ /:$/)) exit 1
+            n = split($0, groups, ":"); count = 0
+            for (i = 1; i <= n; i++) {
+                if (groups[i] == "") continue
+                if (length(groups[i]) > 4) exit 1
+                count++
+            }
+            if (compressed) exit !(count < 8)
+            exit !(count == 8)
+        }
+    '
+}
+
+valid_host() {
+    local host="$1" label
+    [[ "$host" == *:* ]] && { valid_ipv6 "$host"; return; }
+    if [[ "$host" =~ ^[0-9.]+$ ]]; then
+        valid_ipv4 "$host"
         return
     fi
+    host=${host%.}
+    [[ -n "$host" && ${#host} -le 253 && "$host" != .* && "$host" != *. && "$host" != *..* ]] || return 1
+    local IFS=.
+    local labels=($host)
+    for label in "${labels[@]}"; do
+        [[ ${#label} -le 63 && "$label" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]] || return 1
+    done
+}
 
-    if ! [[ $choice =~ ^[0-9]+$ ]]; then
-        echo "无效输入，请输入数字。"
+split_address() {
+    if [[ "$1" =~ ^\[([^]]+)\]:([0-9]+)$ ]]; then
+        ADDRESS_HOST=${BASH_REMATCH[1]} ADDRESS_PORT=${BASH_REMATCH[2]}
+        valid_ipv6 "$ADDRESS_HOST" || return 1
+    elif [[ "$1" =~ ^([^:]+):([0-9]+)$ ]]; then
+        ADDRESS_HOST=${BASH_REMATCH[1]} ADDRESS_PORT=${BASH_REMATCH[2]}
+        valid_host "$ADDRESS_HOST" || return 1
+    else
+        return 1
+    fi
+    valid_port "$ADDRESS_PORT"
+}
+
+make_address() {
+    if [[ "$1" == *:* ]]; then printf '[%s]:%s' "$1" "$2"
+    else printf '%s:%s' "$1" "$2"; fi
+}
+
+validate_rule() {
+    local listen="$1" remote="$2" skip="$3" host port i other_host
+    split_address "$listen" || { echo "监听地址或端口无效。"; return 1; }
+    host=$(printf '%s' "$ADDRESS_HOST" | tr 'A-F' 'a-f')
+    port=$((10#$ADDRESS_PORT))
+    if [[ "$host" != *:* ]]; then
+        valid_ipv4 "$host" || { echo "监听地址必须是 IPv4 或 IPv6 地址。"; return 1; }
+    fi
+    split_address "$remote" || { echo "目标地址或端口无效。"; return 1; }
+    for ((i=0; i<${#RULE_STARTS[@]}; i++)); do
+        [[ "$i" == "$skip" ]] && continue
+        split_address "${RULE_LISTENS[i]}" || continue
+        [[ "$port" -eq $((10#$ADDRESS_PORT)) ]] || continue
+        other_host=$(printf '%s' "$ADDRESS_HOST" | tr 'A-F' 'a-f')
+        if [[ "$host" == "$other_host" || "$host" == :: || "$other_host" == :: ]] ||
+           { [[ "$host" != *:* && "$other_host" != *:* ]] && [[ "$host" == 0.0.0.0 || "$other_host" == 0.0.0.0 ]]; }; then
+            echo "监听地址与第 $((i+1)) 条规则冲突。"
+            return 1
+        fi
+    done
+}
+
+new_rule_file() {
+    local candidate
+    candidate=$(mktemp "${CONFIG_FILE}.tmp.XXXXXX") || return 1
+    if ! cp -p "$CONFIG_FILE" "$candidate"; then
+        rm -f "$candidate"
+        return 1
+    fi
+    printf '%s\n' "$candidate"
+}
+
+# 输出指定规则的有效 no_tcp / use_udp，端点配置覆盖全局配置。
+rule_protocols() {
+    awk -v target="$1" '
+        BEGIN { tcp = udp = 0 }
+        /^[ \t]*\[/ {
+            section = $0; sub(/[ \t]*#.*/, "", section); gsub(/[ \t]/, "", section)
+            if (section == "[[endpoints]]") index_++
+        }
+        /^[ \t]*(no_tcp|use_udp)[ \t]*=[ \t]*(true|false)[ \t]*(#.*)?$/ {
+            key = $0; sub(/^[ \t]*/, "", key); sub(/[ \t]*=.*/, "", key)
+            value = ($0 ~ /=[ \t]*true/)
+            if (section == "[network]") {
+                if (key == "no_tcp") tcp = value; else udp = value
+            }
+            if (section == "[endpoints.network]" && index_ == target) {
+                if (key == "no_tcp") { endpoint_tcp = value; has_tcp = 1 }
+                else { endpoint_udp = value; has_udp = 1 }
+            }
+        }
+        END { print (has_tcp ? endpoint_tcp : tcp), (has_udp ? endpoint_udp : udp) }
+    ' "$CONFIG_FILE"
+}
+
+restart_realm() {
+    load_rules
+    # 删除最后一条规则后，空配置没有转发任务，停止服务即可。
+    if [[ ${#RULE_STARTS[@]} -eq 0 ]]; then
+        systemctl stop realm.service
         return
     fi
+    local pid i address tcp_selector udp_selector no_tcp use_udp
+    systemctl restart realm.service || return 1
+    # Type=simple 的启动命令可能先于配置解析、端口绑定完成。
+    sleep 1
+    systemctl is-active --quiet realm.service || return 1
+    pid=$(systemctl show --property=MainPID --value realm.service) || return 1
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    for ((i=0; i<${#RULE_STARTS[@]}; i++)); do
+        address=${RULE_LISTENS[i]}
+        split_address "$address" || return 1
+        if [[ "$ADDRESS_HOST" == *:* && -z "${ADDRESS_HOST//[:0]/}" ]]; then
+            tcp_selector="TCP:$ADDRESS_PORT" udp_selector="UDP:$ADDRESS_PORT"
+        else
+            tcp_selector="TCP@$address" udp_selector="UDP@$address"
+        fi
+        read -r no_tcp use_udp < <(rule_protocols "$((i+1))")
+        if [[ "$no_tcp" == 0 ]] && ! lsof -nP -a -p "$pid" -i "$tcp_selector" -sTCP:LISTEN -t >/dev/null 2>&1; then
+            echo "第 $((i+1)) 条规则的 TCP 端口未由 Realm 监听。"
+            return 1
+        fi
+        if [[ "$use_udp" == 1 ]] && ! lsof -nP -a -p "$pid" -i "$udp_selector" -t >/dev/null 2>&1; then
+            echo "第 $((i+1)) 条规则的 UDP 端口未由 Realm 监听。"
+            return 1
+        fi
+    done
+}
 
-    if [ $choice -lt 1 ] || [ $choice -gt ${#lines[@]} ]; then
-        echo "选择超出范围，请输入有效序号。"
-        return
-  fi
+# 候选配置必须位于原文件所在目录，以便用 rename 原子替换。
+save_rules() {
+    local candidate="$1" backup restore
+    # 交互期间被其他进程修改时，不覆盖外部修改。
+    if ! cmp -s "$CONFIG_FILE" "$RULE_SNAPSHOT"; then
+        echo "配置在操作期间已变化，请重新选择规则。"
+        rm -f "$candidate"
+        return 1
+    fi
+    backup=$(mktemp "${CONFIG_FILE}.bak.XXXXXX") || { rm -f "$candidate"; return 1; }
+    if ! cp -p "$CONFIG_FILE" "$backup" || ! mv -f "$candidate" "$CONFIG_FILE"; then
+        echo "保存配置失败。备份：$backup"
+        rm -f "$candidate"
+        return 1
+    fi
+    if restart_realm; then
+        log "规则配置已保存，备份: $backup"
+        echo "保存成功，服务状态已更新。备份：$backup"
+        return 0
+    fi
+    echo "服务重启失败，正在恢复原配置。"
+    restore=$(mktemp "${CONFIG_FILE}.restore.XXXXXX") || return 1
+    if cp -p "$backup" "$restore" && mv -f "$restore" "$CONFIG_FILE"; then
+        if restart_realm; then
+            echo "已恢复原配置和服务。"
+        else
+            echo "原配置已恢复，但服务恢复失败，请检查服务日志。备份：$backup"
+        fi
+    else
+        rm -f "$restore"
+        echo "恢复配置失败，请使用备份：$backup"
+    fi
+    log "规则配置生效失败，备份: $backup"
+    return 1
+}
 
-  local chosen_line=${lines[$((choice-1))]}
-  local start_line=$(echo $chosen_line | cut -d ':' -f 1)
+edit_rule() {
+    local RULE_SNAPSHOT candidate result index listen remote remark
+    local listen_host listen_port remote_host remote_port answer value
+    [[ -f "$CONFIG_FILE" ]] || { echo "没有发现任何转发规则。"; return; }
+    RULE_SNAPSHOT=$(mktemp "${CONFIG_FILE}.snapshot.XXXXXX") || return 1
+    cp -p "$CONFIG_FILE" "$RULE_SNAPSHOT" || { rm -f "$RULE_SNAPSHOT"; return 1; }
+    edit_rule_inputs
+    result=$?
+    rm -f "$RULE_SNAPSHOT"
+    return "$result"
+}
 
-  # 找到下一个 [[endpoints]] 行，确定删除范围的结束行
-  local next_endpoints_line=$(grep -n '^\[\[endpoints\]\]' /root/realm/config.toml | grep -A 1 "^$start_line:" | tail -n 1 | cut -d ':' -f 1)
+edit_rule_inputs() {
+    select_rule "编辑" || return 0
+    index=$RULE_INDEX
+    listen=${RULE_LISTENS[index]} remote=${RULE_REMOTES[index]} remark=${RULE_REMARKS[index]}
+    split_address "$listen" || { echo "无法识别该规则的监听字段，未修改配置。"; return 1; }
+    listen_host=$ADDRESS_HOST listen_port=$ADDRESS_PORT
+    split_address "$remote" || { echo "无法识别该规则的目标字段，未修改配置。"; return 1; }
+    remote_host=$ADDRESS_HOST remote_port=$ADDRESS_PORT
+    echo "回车保留原值，q 取消；备注输入 - 清空。IPv6 地址无需方括号。"
+    for value in listen_host listen_port remote_host remote_port remark; do
+        case "$value" in
+            listen_host) answer="监听地址" ;;
+            listen_port) answer="监听端口" ;;
+            remote_host) answer="目标地址" ;;
+            remote_port) answer="目标端口" ;;
+            remark) answer="备注" ;;
+        esac
+        read -rp "$answer [${!value}]: " answer || return 0
+        [[ "$answer" != q ]] || return 0
+        [[ -z "$answer" ]] || printf -v "$value" '%s' "$answer"
+    done
+    [[ "$remark" != - ]] || remark=""
+    listen_host=${listen_host#[}; listen_host=${listen_host%]}
+    remote_host=${remote_host#[}; remote_host=${remote_host%]}
+    listen=$(make_address "$listen_host" "$listen_port")
+    remote=$(make_address "$remote_host" "$remote_port")
+    validate_rule "$listen" "$remote" "$index" || return 1
+    if [[ "$listen" == "${RULE_LISTENS[index]}" && "$remote" == "${RULE_REMOTES[index]}" && "$remark" == "${RULE_REMARKS[index]}" ]]; then
+        echo "规则没有变化。"
+        return 0
+    fi
+    printf '监听：%s → %s\n目标：%s → %s\n备注：%s → %s\n' "${RULE_LISTENS[index]}" "$listen" "${RULE_REMOTES[index]}" "$remote" "${RULE_REMARKS[index]}" "$remark"
+    read -rp "确认保存并重启服务？(y/N): " answer || return 0
+    [[ "$answer" == y || "$answer" == Y ]] || return 0
+    candidate=$(new_rule_file) || return 1
+    # 环境变量传值，避免 awk -v 将备注里的反斜杠解释成转义字符。
+    if ! RULE_LISTEN="$listen" RULE_REMOTE="$remote" RULE_REMARK="$remark" awk \
+        -v start="${RULE_STARTS[index]}" -v end="${RULE_ENDS[index]}" '
+        function address_line(line, value, prefix, rest) {
+            match(line, /=[ \t]*/)
+            prefix = substr(line, 1, RSTART + RLENGTH - 1)
+            rest = substr(line, RSTART + RLENGTH)
+            match(rest, /^("[^"\\]*"|\047[^\047]*\047)/)
+            return prefix "\"" value "\"" substr(rest, RLENGTH + 1)
+        }
+        NR == start {
+            print
+            if (ENVIRON["RULE_REMARK"] != "") print "# 备注: " ENVIRON["RULE_REMARK"]
+            next
+        }
+        NR > start && /^[ \t]*\[/ { nested = 1 }
+        NR > start && NR <= end && !nested {
+            if ($0 ~ /^[ \t]*#[ \t]*备注:/) next
+            if ($0 ~ /^[ \t]*listen[ \t]*=/) { print address_line($0, ENVIRON["RULE_LISTEN"]); next }
+            if ($0 ~ /^[ \t]*remote[ \t]*=/) { print address_line($0, ENVIRON["RULE_REMOTE"]); next }
+        }
+        { print }
+    ' "$CONFIG_FILE" > "$candidate"; then
+        rm -f "$candidate"
+        return 1
+    fi
+    save_rules "$candidate"
+}
 
-  if [ -z "$next_endpoints_line" ] || [ "$next_endpoints_line" -le "$start_line" ]; then
-    # 如果没有找到下一个 [[endpoints]]，则删除到文件末尾
-    end_line=$(wc -l < /root/realm/config.toml)
-  else
-    # 如果找到了下一个 [[endpoints]]，则删除到它的前一行
-    end_line=$((next_endpoints_line - 1))
-  fi
+delete_rule() {
+    local RULE_SNAPSHOT candidate result index
+    [[ -f "$CONFIG_FILE" ]] || { echo "没有发现任何转发规则。"; return; }
+    RULE_SNAPSHOT=$(mktemp "${CONFIG_FILE}.snapshot.XXXXXX") || return 1
+    cp -p "$CONFIG_FILE" "$RULE_SNAPSHOT" || { rm -f "$RULE_SNAPSHOT"; return 1; }
+    if select_rule "删除"; then
+        index=$RULE_INDEX
+        candidate=$(new_rule_file) || { rm -f "$RULE_SNAPSHOT"; return 1; }
+        if awk -v start="${RULE_STARTS[index]}" -v end="${RULE_ENDS[index]}" \
+            'NR < start || NR > end' "$CONFIG_FILE" > "$candidate"; then
+            save_rules "$candidate"
+            result=$?
+        else
+            rm -f "$candidate"
+            result=1
+        fi
+    else
+        result=0
+    fi
+    rm -f "$RULE_SNAPSHOT"
+    return "$result"
+}
 
-  # 使用 sed 删除指定行范围的内容
-  sed -i "${start_line},${end_line}d" /root/realm/config.toml
-
-  # 检查并删除可能多余的空行
-  sed -i '/^\s*$/d' /root/realm/config.toml
-
-  echo "转发规则及其备注已删除。"
-
-  # 重启服务
-  sudo systemctl restart realm.service
+# 添加转发规则，与编辑共用地址验证和配置保存逻辑。
+add_rule() {
+    local local_port remote_ip remote_port remark ip_choice listen_addr remote_addr cont
+    local RULE_SNAPSHOT candidate result
+    [[ -f "$CONFIG_FILE" ]] || { echo "请先安装 Realm。"; return 1; }
+    while :; do
+        echo "添加新规则（输入 q 退出）"
+        read -rp "本地监听端口: " local_port || return 0
+        [[ "$local_port" != q ]] || return 0
+        read -rp "目标服务器 IP 或域名: " remote_ip || return 0
+        [[ "$remote_ip" != q ]] || return 0
+        read -rp "目标端口: " remote_port || return 0
+        [[ "$remote_port" != q ]] || return 0
+        read -rp "规则备注: " remark || return 0
+        [[ "$remark" != q ]] || return 0
+        valid_port "$local_port" && valid_port "$remote_port" || { echo "端口必须在 1–65535 之间。"; continue; }
+        echo "1) 双栈监听 [::]:${local_port}（默认）"
+        echo "2) 仅 IPv4 监听 0.0.0.0:$local_port"
+        echo "3) 自定义监听地址"
+        read -rp "请输入选项 [1-3]: " ip_choice || return 0
+        case "${ip_choice:-1}" in
+            1) listen_addr="[::]:$local_port" ;;
+            2) listen_addr="0.0.0.0:$local_port" ;;
+            3) read -rp "完整监听地址（如 127.0.0.1:80 或 [::1]:443）: " listen_addr || return 0 ;;
+            q) return 0 ;;
+            *) echo "无效监听模式。"; continue ;;
+        esac
+        [[ "$listen_addr" != q ]] || return 0
+        remote_ip=${remote_ip#[}; remote_ip=${remote_ip%]}
+        remote_addr=$(make_address "$remote_ip" "$remote_port")
+        RULE_SNAPSHOT=$(mktemp "${CONFIG_FILE}.snapshot.XXXXXX") || return 1
+        cp -p "$CONFIG_FILE" "$RULE_SNAPSHOT" || { rm -f "$RULE_SNAPSHOT"; return 1; }
+        load_rules
+        if ! validate_rule "$listen_addr" "$remote_addr" -1; then
+            rm -f "$RULE_SNAPSHOT"
+            continue
+        fi
+        candidate=$(new_rule_file) || { rm -f "$RULE_SNAPSHOT"; return 1; }
+        if printf '\n[[endpoints]]\n# 备注: %s\nlisten = "%s"\nremote = "%s"\n' \
+            "$remark" "$listen_addr" "$remote_addr" >> "$candidate"; then
+            save_rules "$candidate"
+            result=$?
+        else
+            rm -f "$candidate"
+            result=1
+        fi
+        rm -f "$RULE_SNAPSHOT"
+        [[ "$result" -eq 0 ]] || return "$result"
+        read -rp "继续添加？(y/n): " cont || return 0
+        [[ "$cont" == y ]] || return 0
+    done
 }
 
 service_control() {
@@ -536,7 +774,7 @@ main_menu() {
         echo -e "    (1)安装前请先更新系统软件包，缺少命令可能无法安装"
         echo -e "    (2)如果启动失败请检查 /root/realm/config.toml下有无多余配置或者卸载后重新配置"
         echo -e "    (3)该脚本只在debian系统下测试，未做其他系统适配，安装命令有别，可能无法启动。如若遇到问题，请自行解决"
-        echo -e "    仓库：https://github.com/qqrrooty/EZrealm${NC}"
+        echo -e "    仓库：https://github.com/jiehu0/EZrealm${NC}"
         echo -e "${YELLOW}▂﹍▂﹍▂﹍▂﹍▂﹍▂﹍▂﹍▂﹍▂﹍▂﹍▂﹍▂﹍▂﹍▂﹍▂﹍▂﹍▂﹍▂﹍▂﹍▂﹍▂${NC}"
         echo -e "  "
         echo -e "${YELLOW}服务状态：$(service_control status)${NC}"
@@ -548,6 +786,7 @@ main_menu() {
         echo "2. 添加转发规则"
         echo "3. 查看转发规则"
         echo "4. 删除转发规则"
+        echo "11. 编辑转发规则"
         echo -e "${YELLOW}------------------${NC}"
         echo "5. 启动服务"
         echo "6. 停止服务"
@@ -567,6 +806,7 @@ main_menu() {
             2) add_rule ;;
             3) show_rules ;;
             4) delete_rule ;;
+            11) edit_rule ;;
             5) service_control start ;;
             6) service_control stop ;;
             7) service_control restart ;;
@@ -596,4 +836,6 @@ main_menu() {
 # ========================================
 # 脚本入口
 # ========================================
-main_menu "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main_menu "$@"
+fi

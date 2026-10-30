@@ -34,7 +34,7 @@ show_menu() {
     echo "     debian系统如果命令无法启动请先更新系统/软件包"
     echo "     该脚本只在debian系统下测试，未做其他系统适配，可能无法启动。如若遇到问题，请自行解决"
     echo "     PS:可能没时间做适配，我尽力而为"
-    echo "     仓库：https://github.com/qqrrooty/EZrealm"
+    echo "     仓库：https://github.com/jiehu0/EZrealm"
     echo " "
     echo "——————————————————"
     echo " 1. 安装 realm"

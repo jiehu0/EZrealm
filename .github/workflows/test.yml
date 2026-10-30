@@ -1,0 +1,42 @@
+name: Rule tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rules:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install listener inspection tool
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y lsof
+      - name: Check Bash syntax
+        run: |
+          while IFS= read -r script; do
+            bash -n "$script"
+          done < <(git ls-files '*.sh')
+      - name: Run rule regression tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Download Realm 2.7.0 and verify checksum
+        env:
+          REALM_RELEASE: https://github.com/zhboner/realm/releases/download/v2.7.0
+        run: |
+          cd "$RUNNER_TEMP"
+          archive=realm-x86_64-unknown-linux-gnu.tar.gz
+          curl -fLsS --retry 3 "$REALM_RELEASE/$archive" -o "$archive"
+          curl -fLsS --retry 3 "$REALM_RELEASE/${archive%.tar.gz}.sha256" -o realm.sha256
+          sha256sum -c realm.sha256
+          tar -xzf "$archive"
+          echo "REALM_BINARY=$RUNNER_TEMP/realm" >> "$GITHUB_ENV"
+      - name: Test real forwarding and rollback with systemd
+        env:
+          REALM_TEST_SYSTEMD: "1"
+        run: python3 -m unittest discover -s tests -p 'integration_*.py' -v
